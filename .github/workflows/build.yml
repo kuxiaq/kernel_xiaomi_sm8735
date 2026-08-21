@@ -1,0 +1,176 @@
+name: Build Kernel with KernelSU Next + SUSFS + NoMount + AnyKernel3
+
+on:
+  workflow_dispatch:
+    inputs:
+      defconfig:
+        description: 'Defconfig name (e.g., onyx_perf.config, gki_defconfig)'
+        required: true
+        default: 'onyx_perf.config'
+      build_target:
+        description: 'Bazel build target'
+        required: true
+        default: '//...'
+
+jobs:
+  build:
+    runs-on: ubuntu-22.04
+    steps:
+      - name: Checkout Kernel Source (with local patches & AnyKernel3)
+        uses: actions/checkout@v4
+        with:
+          repository: kuxiaq/kernel_xiaomi_sm8735
+          ref: oss
+          path: kernel
+
+      - name: Checkout KernelSU Next
+        uses: actions/checkout@v4
+        with:
+          repository: KernelSU-Next/KernelSU-Next
+          path: KernelSU-Next
+
+      - name: Setup Build Environment
+        run: |
+          sudo apt update
+          sudo apt install -y git make gcc clang lld bc bison flex libssl-dev \
+            libelf-dev ccache ninja-build bazel
+
+      # ------------------------------------------------------------
+      # 1. Apply KernelSU Next
+      # ------------------------------------------------------------
+      - name: Apply KernelSU Next
+        working-directory: kernel
+        run: |
+          cp -r ../KernelSU-Next/kernel/* .
+          # If KernelSU-Next has its own patch, apply it (optional)
+          # patch -p1 -N < ../KernelSU-Next/kernel.patch || true
+
+      # ------------------------------------------------------------
+      # 2. Apply SUSFS (local patches)
+      # ------------------------------------------------------------
+      - name: Apply SUSFS Patches
+        working-directory: kernel
+        run: |
+          if [ -d "susfs" ]; then
+            echo "Applying SUSFS from local repo"
+            cp susfs/fs/susfs.c fs/
+            cp susfs/include/linux/susfs.h include/linux/
+            cp susfs/include/linux/susfs_def.h include/linux/
+            patch -p1 -N < susfs/50_add_susfs_in_kernel.patch || echo "Patch already applied or failed"
+            if [ -f "susfs/KernelSU/10_enable_susfs_for_ksu.patch" ]; then
+              patch -p1 -N < susfs/KernelSU/10_enable_susfs_for_ksu.patch || echo "KSU patch already applied or failed"
+            fi
+          else
+            echo "WARNING: susfs/ folder not found, skipping SUSFS"
+          fi
+
+      # ------------------------------------------------------------
+      # 3. Apply NoMount (local patches/source)
+      # ------------------------------------------------------------
+      - name: Apply NoMount Patches
+        working-directory: kernel
+        run: |
+          if [ -d "nomount" ]; then
+            echo "Applying NoMount from local repo"
+            # Apply any .patch files
+            for patch in nomount/*.patch; do
+              if [ -f "$patch" ]; then
+                patch -p1 -N < "$patch" || echo "Patch $patch already applied or failed"
+              fi
+            done
+            # If no patches, copy source files (assuming they belong in root)
+            if ! ls nomount/*.patch 1> /dev/null 2>&1; then
+              echo "No patch files found, copying source files"
+              cp -r nomount/* . 2>/dev/null || true
+            fi
+          else
+            echo "WARNING: nomount/ folder not found, skipping NoMount"
+          fi
+
+      # ------------------------------------------------------------
+      # 4. Configure Kernel (enable features)
+      # ------------------------------------------------------------
+      - name: Configure Kernel
+        working-directory: kernel
+        run: |
+          DEFCONFIG="${{ github.event.inputs.defconfig }}"
+          if [ -f "arch/arm64/configs/vendor/$DEFCONFIG" ]; then
+            CONFIG_PATH="arch/arm64/configs/vendor/$DEFCONFIG"
+          elif [ -f "arch/arm64/configs/$DEFCONFIG" ]; then
+            CONFIG_PATH="arch/arm64/configs/$DEFCONFIG"
+          else
+            echo "Defconfig not found!"
+            exit 1
+          fi
+          echo "Enabling KernelSU & SUSFS in $CONFIG_PATH"
+          echo "CONFIG_KSU=y" >> "$CONFIG_PATH"
+          echo "CONFIG_KSU_SUSFS=y" >> "$CONFIG_PATH"
+          echo "CONFIG_NOMOUNT=y" >> "$CONFIG_PATH" 2>/dev/null || true
+
+      # ------------------------------------------------------------
+      # 5. Build with Bazel
+      # ------------------------------------------------------------
+      - name: Build with Bazel
+        working-directory: kernel
+        run: |
+          bazel build ${{ github.event.inputs.build_target }} --config=fast --config=stamp
+
+      # ------------------------------------------------------------
+      # 6. Locate Kernel Image
+      # ------------------------------------------------------------
+      - name: Locate Kernel Image
+        id: locate_kernel
+        working-directory: kernel
+        run: |
+          CANDIDATES=(
+            "out/arch/arm64/boot/Image.gz-dtb"
+            "out/arch/arm64/boot/Image.gz"
+            "out/arch/arm64/boot/Image"
+            "bazel-bin/arch/arm64/boot/Image.gz-dtb"
+            "bazel-bin/arch/arm64/boot/Image.gz"
+            "bazel-bin/arch/arm64/boot/Image"
+          )
+          for candidate in "${CANDIDATES[@]}"; do
+            if [ -f "$candidate" ]; then
+              echo "image_path=$candidate" >> $GITHUB_OUTPUT
+              echo "Found: $candidate"
+              exit 0
+            fi
+          done
+          echo "No kernel image found!"
+          exit 1
+
+      # ------------------------------------------------------------
+      # 7. Package with Local AnyKernel3
+      # ------------------------------------------------------------
+      - name: Package with AnyKernel3
+        working-directory: kernel
+        run: |
+          if [ ! -d "anykernel3" ]; then
+            echo "ERROR: anykernel3/ folder not found in kernel repo!"
+            echo "Please add it to your kernel root directory."
+            exit 1
+          fi
+
+          IMAGE="${{ steps.locate_kernel.outputs.image_path }}"
+          cp "$IMAGE" anykernel3/Image.gz-dtb
+
+          # (Optional) Copy dtb/dtbo if your device needs it
+          # cp out/arch/arm64/boot/dtb anykernel3/dtb 2>/dev/null || true
+
+          cd anykernel3
+          # Clean up any leftover git files
+          rm -rf .git .github
+          # Create the flashable ZIP
+          zip -r9 AnyKernel3.zip * -x "*.zip"
+          cd ..
+          mv anykernel3/AnyKernel3.zip .
+
+      # ------------------------------------------------------------
+      # 8. Upload Flashable ZIP
+      # ------------------------------------------------------------
+      - name: Upload Artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: kernel-flashable-onyx
+          path: kernel/AnyKernel3.zip
