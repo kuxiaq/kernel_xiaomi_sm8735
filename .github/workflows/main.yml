@@ -1,0 +1,121 @@
+name: Build Kernel with KernelSU Next + SUSFS + NoMount
+
+on:
+  workflow_dispatch:
+    inputs:
+      defconfig:
+        description: 'Defconfig name (e.g., onyx_perf.config, gki_defconfig)'
+        required: true
+        default: 'onyx_perf.config'
+      build_target:
+        description: 'Bazel build target (e.g., //... or //kernel:Image)'
+        required: true
+        default: '//...'
+
+jobs:
+  build:
+    runs-on: ubuntu-22.04
+    steps:
+      - name: Checkout Kernel Source
+        uses: actions/checkout@v4
+        with:
+          repository: kuxiaq/kernel_xiaomi_sm8735
+          ref: oss
+          path: kernel
+
+      - name: Checkout KernelSU Next
+        uses: actions/checkout@v4
+        with:
+          repository: KernelSU-Next/KernelSU-Next
+          path: KernelSU-Next
+
+      - name: Checkout SUSFS (Android 15 / 6.6)
+        uses: actions/checkout@v4
+        with:
+          repository: simonpunk/susfs4ksu
+          ref: gki-android15-6.6
+          path: susfs4ksu
+
+      - name: Checkout NoMount
+        uses: actions/checkout@v4
+        with:
+          repository: maxsteeel/nomount
+          path: nomount
+
+      - name: Setup Build Environment
+        run: |
+          sudo apt update
+          sudo apt install -y git make gcc clang lld bc bison flex libssl-dev \
+            libelf-dev ccache ninja-build bazel
+
+      - name: Apply KernelSU Next
+        working-directory: kernel
+        run: |
+          # Copy KernelSU Next driver into kernel tree
+          cp -r ../KernelSU-Next/kernel/* .
+
+      - name: Apply SUSFS Patches
+        working-directory: kernel
+        run: |
+          # Copy SUSFS source files
+          cp ../susfs4ksu/kernel_patches/fs/susfs.c fs/
+          cp ../susfs4ksu/kernel_patches/include/linux/susfs.h include/linux/
+
+          # Apply main SUSFS patch
+          patch -p1 < ../susfs4ksu/kernel_patches/50_add_susfs_in_kernel.patch || echo "SUSFS patch failed - manual fix needed"
+
+          # Apply KernelSU-Next compatibility patch if it exists
+          if [ -f "../susfs4ksu/kernel_patches/KernelSU/10_enable_susfs_for_ksu.patch" ]; then
+            patch -p1 < ../susfs4ksu/kernel_patches/KernelSU/10_enable_susfs_for_ksu.patch || echo "KSU patch failed"
+          fi
+
+      - name: Apply NoMount Patches
+        working-directory: kernel
+        run: |
+          # Look for any patch files in the nomount repo and apply them
+          for patch in ../nomount/*.patch; do
+            if [ -f "$patch" ]; then
+              echo "Applying $patch"
+              patch -p1 < "$patch" || echo "Patch $patch failed"
+            fi
+          done
+
+          # If no patches, copy source files (assuming they are meant to be integrated)
+          if [ ! -f "../nomount/*.patch" ]; then
+            echo "No patch files found, copying source files from nomount"
+            cp -r ../nomount/* . 2>/dev/null || true
+          fi
+
+      - name: Configure Kernel
+        working-directory: kernel
+        run: |
+          # Select the defconfig file (from workflow input)
+          DEFCONFIG="${{ github.event.inputs.defconfig }}"
+          
+          # If defconfig is under vendor/ subdir, adjust path
+          if [ -f "arch/arm64/configs/vendor/$DEFCONFIG" ]; then
+            CONFIG_PATH="arch/arm64/configs/vendor/$DEFCONFIG"
+          elif [ -f "arch/arm64/configs/$DEFCONFIG" ]; then
+            CONFIG_PATH="arch/arm64/configs/$DEFCONFIG"
+          else
+            echo "Defconfig not found! Check the name."
+            exit 1
+          fi
+
+          echo "Enabling KernelSU and SUSFS in $CONFIG_PATH"
+          echo "CONFIG_KSU=y" >> "$CONFIG_PATH"
+          echo "CONFIG_KSU_SUSFS=y" >> "$CONFIG_PATH"
+          # NoMount may not have a dedicated config, but if it does, enable it
+          echo "CONFIG_NOMOUNT=y" >> "$CONFIG_PATH" 2>/dev/null || true
+
+      - name: Build with Bazel
+        working-directory: kernel
+        run: |
+          # Use the build target from input (default //...)
+          bazel build ${{ github.event.inputs.build_target }} --config=fast --config=stamp
+
+      - name: Upload Artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: kernel-images
+          path: kernel/out/**/*.img  # Adjust if output path differs
