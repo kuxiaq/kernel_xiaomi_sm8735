@@ -23,27 +23,35 @@ jobs:
           ref: oss
           path: kernel
 
-      - name: Checkout KernelSU Next
-        uses: actions/checkout@v4
-        with:
-          repository: KernelSU-Next/KernelSU-Next
-          path: KernelSU-Next
-
       - name: Setup Build Environment
         run: |
           sudo apt update
           sudo apt install -y git make gcc clang lld bc bison flex libssl-dev \
-            libelf-dev ccache ninja-build
+            libelf-dev ccache ninja-build curl
           # Install Bazelisk as bazel
           wget https://github.com/bazelbuild/bazelisk/releases/latest/download/bazelisk-linux-amd64
           chmod +x bazelisk-linux-amd64
           sudo mv bazelisk-linux-amd64 /usr/local/bin/bazel
           bazel --version
 
-      - name: Apply KernelSU Next
+      # ------------------------------------------------------------
+      # 1. Integrate KernelSU Next using its official script
+      # ------------------------------------------------------------
+      - name: Integrate KernelSU Next
         working-directory: kernel
-        run: cp -r ../KernelSU-Next/kernel/* .
+        run: |
+          # Use KernelSU Next's recommended integration script
+          curl -LSs "https://raw.githubusercontent.com/KernelSU-Next/KernelSU-Next/next/kernel/setup.sh" | bash -s -- --yes
+          # If the script fails, fallback to manual copy (optional)
+          if [ $? -ne 0 ]; then
+            echo "Script failed, falling back to manual copy"
+            git clone --depth=1 https://github.com/KernelSU-Next/KernelSU-Next ../KernelSU-Next
+            cp -r ../KernelSU-Next/kernel/* .
+          fi
 
+      # ------------------------------------------------------------
+      # 2. Apply SUSFS (local patches)
+      # ------------------------------------------------------------
       - name: Apply SUSFS Patches
         working-directory: kernel
         run: |
@@ -59,6 +67,9 @@ jobs:
             echo "WARNING: susfs/ folder not found, skipping SUSFS"
           fi
 
+      # ------------------------------------------------------------
+      # 3. Apply NoMount (local patches/source)
+      # ------------------------------------------------------------
       - name: Apply NoMount Patches
         working-directory: kernel
         run: |
@@ -75,6 +86,9 @@ jobs:
             echo "WARNING: nomount/ folder not found, skipping NoMount"
           fi
 
+      # ------------------------------------------------------------
+      # 4. Configure Kernel (enable features)
+      # ------------------------------------------------------------
       - name: Configure Kernel
         working-directory: kernel
         run: |
@@ -91,11 +105,17 @@ jobs:
           echo "CONFIG_KSU_SUSFS=y" >> "$CONFIG_PATH"
           echo "CONFIG_NOMOUNT=y" >> "$CONFIG_PATH" 2>/dev/null || true
 
+      # ------------------------------------------------------------
+      # 5. Build with Bazel
+      # ------------------------------------------------------------
       - name: Build with Bazel
         working-directory: kernel
         run: |
           bazel build ${{ github.event.inputs.build_target }} --config=fast --config=stamp
 
+      # ------------------------------------------------------------
+      # 6. Locate Kernel Image
+      # ------------------------------------------------------------
       - name: Locate Kernel Image
         id: locate_kernel
         working-directory: kernel
@@ -118,6 +138,9 @@ jobs:
           echo "No kernel image found!"
           exit 1
 
+      # ------------------------------------------------------------
+      # 7. Package with Local AnyKernel3
+      # ------------------------------------------------------------
       - name: Package with AnyKernel3
         working-directory: kernel
         run: |
@@ -133,6 +156,9 @@ jobs:
           cd ..
           mv anykernel3/AnyKernel3.zip .
 
+      # ------------------------------------------------------------
+      # 8. Upload Flashable ZIP
+      # ------------------------------------------------------------
       - name: Upload Artifacts
         uses: actions/upload-artifact@v4
         with:
