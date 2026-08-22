@@ -225,6 +225,32 @@ jobs:
           echo "Staged $(ls /config | wc -l) config fragments:"
           ls /config
 
+          echo "--- Generating config headers from staged .conf fragments ---"
+          # Soong normally converts each .conf fragment (CONFIG_X=y lines) into
+          # a C header before compiling, referenced via `-include /config/X.h`
+          # in the module's Kbuild. We replicate that conversion here. Two
+          # output names are written per .conf since different modules'
+          # genrules use slightly different naming conventions:
+          #   name.conf -> nameconf.h   (e.g. waipiommrm.conf -> waipiommrmconf.h)
+          #   name.conf -> name.h       (e.g. sec-kernel_defconfig.conf -> sec-kernel_defconfig.h)
+          for conf in /config/*.conf; do
+            [ -f "$conf" ] || continue
+            base=$(basename "$conf" .conf)
+            for out in "/config/${base}conf.h" "/config/${base}.h"; do
+              {
+                echo "#pragma once"
+                grep -E '^CONFIG_[A-Za-z0-9_]+=.+' "$conf" | while IFS='=' read -r key val; do
+                  case "$val" in
+                    y) echo "#define ${key} 1" ;;
+                    n) : ;;
+                    *) echo "#define ${key} ${val}" ;;
+                  esac
+                done
+              } > "$out"
+            done
+          done
+          echo "Generated $(ls /config/*.h 2>/dev/null | wc -l) header variants"
+
       - name: Build Out-of-Tree Kernel Modules
         working-directory: kernel
         run: |
