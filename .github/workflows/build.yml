@@ -118,7 +118,7 @@ jobs:
           mkdir -p /tmp/clang
           # Google's AOSP clang prebuilts mirror. Adjust the URL/host if this
           # exact version isn't published there under this path.
-          wget -q "https://android.googlesource.com/platform/prebuilts/clang/host/linux-x86/+archive/refs/heads/main/clang-$CLANG_VERSION.tar.gz" -O /tmp/clang.tar.gz \
+          wget -q "https://android.googlesource.com/platform/prebuilts/clang/host/linux-x86/+/refs/tags/android-14.0.0_r66/clang-r510928/" -O /tmp/clang.tar.gz \
             || { echo "ERROR: could not fetch clang-$CLANG_VERSION automatically. Download it manually and adjust this step."; exit 1; }
           tar -xzf /tmp/clang.tar.gz -C /tmp/clang
           echo "/tmp/clang/bin" >> $GITHUB_PATH
