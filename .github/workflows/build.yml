@@ -24,11 +24,6 @@ jobs:
           sudo apt update
           sudo apt install -y git make gcc clang lld bc bison flex libssl-dev \
             libelf-dev ccache ninja-build curl
-          # Install Bazelisk as bazel (used as a fallback if the repo has no bazel wrapper)
-          wget https://github.com/bazelbuild/bazelisk/releases/latest/download/bazelisk-linux-amd64
-          chmod +x bazelisk-linux-amd64
-          sudo mv bazelisk-linux-amd64 /usr/local/bin/bazel
-          bazel --version
 
       # ------------------------------------------------------------
       # 1. Integrate ReSukiSU using its official script
@@ -57,10 +52,6 @@ jobs:
               for patch in "${patches[@]}"; do
                 echo "=== Applying $patch ==="
                 patch -p1 -N < "$patch"
-                # patch -N returns nonzero on already-applied hunks too, so don't
-                # rely on exit code alone — verify no .rej files were produced,
-                # since a reject means a hunk silently failed while others
-                # succeeded (exactly the "wired in but file missing" failure mode).
                 rejects=$(find . -name "*.rej" -newer "$patch" 2>/dev/null)
                 if [ -n "$rejects" ]; then
                   echo "ERROR: patch produced reject files, applied only partially:"
@@ -99,7 +90,7 @@ jobs:
           fi
 
       # ------------------------------------------------------------
-      # 4. Download pinned Clang toolchain (CLANG_VERSION from build.config.constants)
+      # 3. Download pinned Clang toolchain (CLANG_VERSION from build.config.constants)
       # ------------------------------------------------------------
       - name: Setup Clang Toolchain
         working-directory: kernel
@@ -107,12 +98,6 @@ jobs:
           CLANG_VERSION=$(grep -oP 'CLANG_VERSION=\K.*' build.config.constants)
           echo "Using clang-$CLANG_VERSION"
           mkdir -p /tmp/clang
-          # AOSP only keeps roughly the last two clang versions on the live
-          # branch head, so refs/heads/main will 404 once a version is
-          # superseded (which is what happened with r510928). Pin to the
-          # specific commit where this version was actually added instead.
-          # Commit map (extend as CLANG_VERSION changes over time):
-          #   r510928 -> 42d100b025eb5f4a41781348016c148e9e912cf9
           case "$CLANG_VERSION" in
             r510928) CLANG_COMMIT="42d100b025eb5f4a41781348016c148e9e912cf9" ;;
             *) CLANG_COMMIT="" ;;
@@ -129,9 +114,6 @@ jobs:
             echo "Fetched clang-$CLANG_VERSION from refs/heads/main"
           else
             echo "ERROR: could not fetch clang-$CLANG_VERSION from any known ref."
-            echo "It may have been pruned further, or CLANG_VERSION changed upstream."
-            echo "Check https://android.googlesource.com/platform/prebuilts/clang/host/linux-x86/+log/refs/heads/main"
-            echo "for the commit that added clang-$CLANG_VERSION and add it to the case statement above."
             exit 1
           fi
 
@@ -140,10 +122,7 @@ jobs:
           echo "CLANG_VERSION=$CLANG_VERSION" >> $GITHUB_ENV
 
       # ------------------------------------------------------------
-      # 5. Merge defconfig fragments (gki_defconfig + sun_perf.config + onyx_perf.config)
-      #    This replicates what Soong's kernel-build step does automatically
-      #    inside a full ROM build, per device_xiaomi_onyx/BoardConfig.mk:
-      #      TARGET_KERNEL_CONFIG := gki_defconfig vendor/sun_perf.config vendor/onyx_perf.config
+      # 4. Merge defconfig fragments (gki_defconfig + sun_perf.config + onyx_perf.config)
       # ------------------------------------------------------------
       - name: Merge Defconfig Fragments
         working-directory: kernel
@@ -155,21 +134,15 @@ jobs:
             arch/arm64/configs/vendor/sun_perf.config \
             arch/arm64/configs/vendor/onyx_perf.config
 
-          # ReSukiSU enablement, applied on top of the merged config.
-          # SUSFS ships natively inside ReSukiSU and doesn't need a separate
-          # config toggle the way KSU-Next's SUSFS patch did — CONFIG_KSU=y
-          # is the only flag ReSukiSU's own docs call out as required.
           cat >> out/.config << 'EOF'
           CONFIG_KSU=y
+          CONFIG_MSM_MMRM=y
           EOF
 
           make ARCH=arm64 O=out olddefconfig
 
       # ------------------------------------------------------------
-      # 6. Build kernel (plain make, no Bazel/Kleaf — this tree's Bazel
-      #    scaffolding is inherited from the upstream common kernel and is
-      #    not wired up for standalone builds; Soong drives it via
-      #    TARGET_KERNEL_SOURCE in the ROM build, which we're replicating here)
+      # 5. Build kernel
       # ------------------------------------------------------------
       - name: Build Kernel
         working-directory: kernel
@@ -182,25 +155,12 @@ jobs:
 
           echo "--- Build output ---"
           find out/arch/arm64/boot -maxdepth 1 -iname "Image*" 2>/dev/null || {
-            echo "ERROR: no kernel Image produced. Check the log above for the first real compile error."
+            echo "ERROR: no kernel Image produced."
             exit 1
           }
 
       # ------------------------------------------------------------
-      # 7. Build out-of-tree QCOM/NXP kernel modules
-      #    These ship Android.bp/BUILD.bazel for Soong/Bazel integration in a
-      #    full ROM build, but each also has a plain Kbuild + Makefile that
-      #    supports the classic external-module build (KERNEL_SRC + M=).
-      #    We chain each module's Module.symvers into KBUILD_EXTRA_SYMBOLS for
-      #    subsequent modules, since several depend on symbols exported by
-      #    earlier ones (mmrm-driver first, most others depend on it).
-      #
-      #    NOTE: this order is best-effort, taken from the listed order in
-      #    device_xiaomi_onyx's BoardConfig.mk (TARGET_KERNEL_EXT_MODULES).
-      #    That list reflects Soong's dependency graph, not necessarily a
-      #    valid sequential build order. If a module fails with undefined
-      #    symbol errors, move it later in MODULE_LIST, after whatever
-      #    driver actually exports the missing symbol.
+      # 6. Build out-of-tree QCOM/NXP kernel modules
       # ------------------------------------------------------------
       - name: Checkout Kernel Modules
         uses: actions/checkout@v4
@@ -210,12 +170,6 @@ jobs:
 
       - name: Stage Module Config Fragments
         run: |
-          # Several Kbuild files do an absolute `include /config/<name>.conf`.
-          # In a real ROM build, Soong generates and stages these per-target
-          # fragments at that path before invoking the module's Kbuild. We
-          # replicate that here by collecting every config/*.conf, config/*.mk,
-          # and *_defconfig file found anywhere in the modules repo and
-          # staging it at /config/<basename>.
           sudo mkdir -p /config
           sudo chmod 777 /config
           find kernel-modules -type f \( -name "*.conf" -o -name "*.mk" -o -name "*_defconfig" \) -print0 | \
@@ -226,13 +180,6 @@ jobs:
           ls /config
 
           echo "--- Generating config headers from staged .conf fragments ---"
-          # Soong normally converts each .conf fragment (CONFIG_X=y lines) into
-          # a C header before compiling, referenced via `-include /config/X.h`
-          # in the module's Kbuild. We replicate that conversion here. Two
-          # output names are written per .conf since different modules'
-          # genrules use slightly different naming conventions:
-          #   name.conf -> nameconf.h   (e.g. waipiommrm.conf -> waipiommrmconf.h)
-          #   name.conf -> name.h       (e.g. sec-kernel_defconfig.conf -> sec-kernel_defconfig.h)
           for conf in /config/*.conf; do
             [ -f "$conf" ] || continue
             base=$(basename "$conf" .conf)
@@ -256,6 +203,9 @@ jobs:
         run: |
           KDIR="$(pwd)/out"
           MODROOT="$(pwd)/../kernel-modules"
+
+          EXTRA_INCLUDES=$(find "$MODROOT" -type d \( -name include -o -name uapi \) -printf ' -I%p')
+          echo "Collected $(echo "$EXTRA_INCLUDES" | wc -w) extra include paths"
 
           MODULE_LIST=(
             "qcom/opensource/mmrm-driver"
@@ -310,6 +260,7 @@ jobs:
               ARCH=arm64 CC=clang LLVM=1 LLVM_IAS=1 \
               CROSS_COMPILE=aarch64-linux-gnu- \
               KBUILD_EXTRA_SYMBOLS="$EXTRA_SYMBOLS" \
+              KCFLAGS="$EXTRA_INCLUDES" \
               modules
             STATUS=$?
             set -e
@@ -334,9 +285,6 @@ jobs:
             printf '  %s\n' "${FAILED_MODULES[@]}"
           fi
 
-      # ------------------------------------------------------------
-      # 8. Collect built .ko files
-      # ------------------------------------------------------------
       - name: Collect Kernel Modules
         working-directory: kernel
         run: |
@@ -344,7 +292,9 @@ jobs:
           find ../kernel-modules -name "*.ko" -exec cp {} out/modules_collected/ \;
           echo "Collected $(ls out/modules_collected | wc -l) .ko files"
 
-
+      # ------------------------------------------------------------
+      # 7. Locate Kernel Image
+      # ------------------------------------------------------------
       - name: Locate Kernel Image
         id: locate_kernel
         working-directory: kernel
@@ -366,7 +316,7 @@ jobs:
           exit 1
 
       # ------------------------------------------------------------
-      # 7. Package with Local AnyKernel3
+      # 8. Package with AnyKernel3
       # ------------------------------------------------------------
       - name: Package with AnyKernel3
         working-directory: kernel
@@ -389,11 +339,10 @@ jobs:
           mv anykernel3/AnyKernel3.zip .
 
       # ------------------------------------------------------------
-      # 8. Upload Flashable ZIP
+      # 9. Upload Flashable ZIP
       # ------------------------------------------------------------
       - name: Upload Artifacts
         uses: actions/upload-artifact@v4
         with:
           name: kernel-flashable-onyx
           path: kernel/AnyKernel3.zip
-          
