@@ -1,0 +1,322 @@
+name: Build Kernel with KernelSU Next + SUSFS + NoMount + AnyKernel3
+
+on:
+  workflow_dispatch:
+    inputs:
+      defconfig:
+        description: 'Defconfig name (unused now — fragment chain is fixed: gki_defconfig + sun_perf.config + onyx_perf.config)'
+        required: false
+        default: 'onyx_perf.config'
+
+jobs:
+  build:
+    runs-on: ubuntu-22.04
+    steps:
+      - name: Checkout Kernel Source
+        uses: actions/checkout@v4
+        with:
+          repository: kuxiaq/kernel_xiaomi_sm8735
+          ref: oss
+          path: kernel
+
+      - name: Setup Build Environment
+        run: |
+          sudo apt update
+          sudo apt install -y git make gcc clang lld bc bison flex libssl-dev \
+            libelf-dev ccache ninja-build curl
+          # Install Bazelisk as bazel (used as a fallback if the repo has no bazel wrapper)
+          wget https://github.com/bazelbuild/bazelisk/releases/latest/download/bazelisk-linux-amd64
+          chmod +x bazelisk-linux-amd64
+          sudo mv bazelisk-linux-amd64 /usr/local/bin/bazel
+          bazel --version
+
+      # ------------------------------------------------------------
+      # 1. Integrate KernelSU Next using its official script
+      # ------------------------------------------------------------
+      - name: Integrate KernelSU Next
+        working-directory: kernel
+        run: |
+          curl -LSs "https://raw.githubusercontent.com/KernelSU-Next/KernelSU-Next/next/kernel/setup.sh" | bash -s -- --yes
+          if [ $? -ne 0 ]; then
+            echo "Script failed, falling back to manual copy"
+            git clone --depth=1 https://github.com/KernelSU-Next/KernelSU-Next ../KernelSU-Next
+            cp -r ../KernelSU-Next/kernel/* .
+          fi
+
+      # ------------------------------------------------------------
+      # 2. Apply SUSFS (local patches)
+      # ------------------------------------------------------------
+      - name: Apply SUSFS Patches
+        working-directory: kernel
+        run: |
+          if [ -d "susfs" ]; then
+            cp susfs/fs/susfs.c fs/
+            cp susfs/include/linux/susfs.h include/linux/
+            cp susfs/include/linux/susfs_def.h include/linux/
+
+            SUSFS_PATCH="susfs/50_add_susfs_in_gki-android15-6.6.patch"
+            if [ -f "$SUSFS_PATCH" ]; then
+              patch -p1 -N < "$SUSFS_PATCH" || echo "Patch already applied or failed"
+            else
+              echo "ERROR: expected SUSFS patch not found at $SUSFS_PATCH"
+              ls -la susfs/
+              exit 1
+            fi
+
+            if [ -f "susfs/KernelSU/10_enable_susfs_for_ksu.patch" ]; then
+              patch -p1 -N < "susfs/KernelSU/10_enable_susfs_for_ksu.patch" || echo "KSU patch already applied or failed"
+            fi
+          else
+            echo "WARNING: susfs/ folder not found, skipping SUSFS"
+          fi
+
+      # ------------------------------------------------------------
+      # 3. Apply NoMount (local patches/source)
+      # ------------------------------------------------------------
+      - name: Apply NoMount Patches
+        working-directory: kernel
+        run: |
+          if [ -d "nomount" ]; then
+            shopt -s nullglob
+            patches=(nomount/*.patch)
+            if [ ${#patches[@]} -eq 0 ]; then
+              echo "WARNING: nomount/ folder exists but contains no .patch files"
+              ls -la nomount/
+              cp -r nomount/* . 2>/dev/null || true
+            else
+              for patch in "${patches[@]}"; do
+                patch -p1 -N < "$patch" || echo "Patch $patch already applied or failed"
+              done
+            fi
+          else
+            echo "WARNING: nomount/ folder not found, skipping NoMount"
+          fi
+
+      # ------------------------------------------------------------
+      # 4. Download pinned Clang toolchain (CLANG_VERSION from build.config.constants)
+      # ------------------------------------------------------------
+      - name: Setup Clang Toolchain
+        working-directory: kernel
+        run: |
+          CLANG_VERSION=$(grep -oP 'CLANG_VERSION=\K.*' build.config.constants)
+          echo "Using clang-$CLANG_VERSION"
+          mkdir -p /tmp/clang
+          # Google's AOSP clang prebuilts mirror. Adjust the URL/host if this
+          # exact version isn't published there under this path.
+          wget -q "https://android.googlesource.com/platform/prebuilts/clang/host/linux-x86/+archive/refs/heads/main/clang-$CLANG_VERSION.tar.gz" -O /tmp/clang.tar.gz \
+            || { echo "ERROR: could not fetch clang-$CLANG_VERSION automatically. Download it manually and adjust this step."; exit 1; }
+          tar -xzf /tmp/clang.tar.gz -C /tmp/clang
+          echo "/tmp/clang/bin" >> $GITHUB_PATH
+          echo "CLANG_VERSION=$CLANG_VERSION" >> $GITHUB_ENV
+
+      # ------------------------------------------------------------
+      # 5. Merge defconfig fragments (gki_defconfig + sun_perf.config + onyx_perf.config)
+      #    This replicates what Soong's kernel-build step does automatically
+      #    inside a full ROM build, per device_xiaomi_onyx/BoardConfig.mk:
+      #      TARGET_KERNEL_CONFIG := gki_defconfig vendor/sun_perf.config vendor/onyx_perf.config
+      # ------------------------------------------------------------
+      - name: Merge Defconfig Fragments
+        working-directory: kernel
+        run: |
+          mkdir -p out
+          ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- LLVM=1 LLVM_IAS=1 \
+            scripts/kconfig/merge_config.sh -O out -m \
+            arch/arm64/configs/gki_defconfig \
+            arch/arm64/configs/vendor/sun_perf.config \
+            arch/arm64/configs/vendor/onyx_perf.config
+
+          # KernelSU Next + SUSFS enablement, applied on top of the merged config
+          cat >> out/.config << 'EOF'
+          CONFIG_KSU=y
+          CONFIG_KSU_SUSFS=y
+          EOF
+
+          make ARCH=arm64 O=out olddefconfig
+
+      # ------------------------------------------------------------
+      # 6. Build kernel (plain make, no Bazel/Kleaf — this tree's Bazel
+      #    scaffolding is inherited from the upstream common kernel and is
+      #    not wired up for standalone builds; Soong drives it via
+      #    TARGET_KERNEL_SOURCE in the ROM build, which we're replicating here)
+      # ------------------------------------------------------------
+      - name: Build Kernel
+        working-directory: kernel
+        run: |
+          make -j$(nproc) ARCH=arm64 O=out \
+            CC=clang LLVM=1 LLVM_IAS=1 \
+            CROSS_COMPILE=aarch64-linux-gnu- \
+            Image
+
+          echo "--- Build output ---"
+          find out/arch/arm64/boot -maxdepth 1 -iname "Image*" 2>/dev/null || {
+            echo "ERROR: no kernel Image produced. Check the log above for the first real compile error."
+            exit 1
+          }
+
+      # ------------------------------------------------------------
+      # 7. Build out-of-tree QCOM/NXP kernel modules
+      #    These ship Android.bp/BUILD.bazel for Soong/Bazel integration in a
+      #    full ROM build, but each also has a plain Kbuild + Makefile that
+      #    supports the classic external-module build (KERNEL_SRC + M=).
+      #    We chain each module's Module.symvers into KBUILD_EXTRA_SYMBOLS for
+      #    subsequent modules, since several depend on symbols exported by
+      #    earlier ones (mmrm-driver first, most others depend on it).
+      #
+      #    NOTE: this order is best-effort, taken from the listed order in
+      #    device_xiaomi_onyx's BoardConfig.mk (TARGET_KERNEL_EXT_MODULES).
+      #    That list reflects Soong's dependency graph, not necessarily a
+      #    valid sequential build order. If a module fails with undefined
+      #    symbol errors, move it later in MODULE_LIST, after whatever
+      #    driver actually exports the missing symbol.
+      # ------------------------------------------------------------
+      - name: Checkout Kernel Modules
+        uses: actions/checkout@v4
+        with:
+          repository: sm8735-dev/kernel_xiaomi_sm8735-modules
+          path: kernel-modules
+
+      - name: Build Out-of-Tree Kernel Modules
+        working-directory: kernel
+        run: |
+          KDIR="$(pwd)/out"
+          MODROOT="$(pwd)/../kernel-modules"
+
+          MODULE_LIST=(
+            "qcom/opensource/mmrm-driver"
+            "qcom/opensource/mm-drivers/hw_fence"
+            "qcom/opensource/mm-drivers/msm_ext_display"
+            "qcom/opensource/mm-drivers/sync_fence"
+            "qcom/opensource/synx-kernel"
+            "qcom/opensource/securemsm-kernel"
+            "qcom/opensource/audio-kernel"
+            "qcom/opensource/camera-kernel"
+            "qcom/opensource/display-drivers/msm"
+            "qcom/opensource/video-driver"
+            "qcom/opensource/eva-kernel"
+            "qcom/opensource/graphics-kernel"
+            "qcom/opensource/dsp-kernel"
+            "qcom/opensource/spu-kernel"
+            "qcom/opensource/touch-drivers"
+            "qcom/opensource/data-kernel/drivers/smem-mailbox"
+            "qcom/opensource/datarmnet/core"
+            "qcom/opensource/datarmnet-ext/mem"
+            "qcom/opensource/datarmnet-ext/aps"
+            "qcom/opensource/datarmnet-ext/offload"
+            "qcom/opensource/datarmnet-ext/perf"
+            "qcom/opensource/datarmnet-ext/perf_tether"
+            "qcom/opensource/datarmnet-ext/sch"
+            "qcom/opensource/datarmnet-ext/shs"
+            "qcom/opensource/datarmnet-ext/wlan"
+            "qcom/opensource/dataipa/drivers/platform/msm"
+            "qcom/opensource/wlan/platform"
+            "qcom/opensource/wlan/qcacld-3.0"
+            "qcom/opensource/bt-kernel"
+            "nxp/opensource/driver"
+          )
+
+          EXTRA_SYMBOLS=""
+          FAILED_MODULES=()
+
+          for mod in "${MODULE_LIST[@]}"; do
+            MODPATH="$MODROOT/$mod"
+            if [ ! -d "$MODPATH" ]; then
+              echo "SKIP: $mod (directory not found in modules repo)"
+              continue
+            fi
+            if [ ! -f "$MODPATH/Kbuild" ] && [ ! -f "$MODPATH/Makefile" ]; then
+              echo "SKIP: $mod (no Kbuild/Makefile — Soong-only, cannot build standalone)"
+              continue
+            fi
+
+            echo "=== Building $mod ==="
+            set +e
+            make -C "$KDIR" M="$MODPATH" \
+              ARCH=arm64 CC=clang LLVM=1 LLVM_IAS=1 \
+              CROSS_COMPILE=aarch64-linux-gnu- \
+              KBUILD_EXTRA_SYMBOLS="$EXTRA_SYMBOLS" \
+              modules
+            STATUS=$?
+            set -e
+
+            if [ $STATUS -ne 0 ]; then
+              echo "FAILED: $mod — continuing so later modules still attempt to build"
+              FAILED_MODULES+=("$mod")
+              continue
+            fi
+
+            if [ -f "$MODPATH/Module.symvers" ]; then
+              EXTRA_SYMBOLS="$EXTRA_SYMBOLS $MODPATH/Module.symvers"
+            fi
+          done
+
+          echo ""
+          echo "--- Module build summary ---"
+          if [ ${#FAILED_MODULES[@]} -eq 0 ]; then
+            echo "All modules built successfully."
+          else
+            echo "Failed modules (likely wrong build order — move these later, after their real dependency):"
+            printf '  %s\n' "${FAILED_MODULES[@]}"
+          fi
+
+      # ------------------------------------------------------------
+      # 8. Collect built .ko files
+      # ------------------------------------------------------------
+      - name: Collect Kernel Modules
+        working-directory: kernel
+        run: |
+          mkdir -p out/modules_collected
+          find ../kernel-modules -name "*.ko" -exec cp {} out/modules_collected/ \;
+          echo "Collected $(ls out/modules_collected | wc -l) .ko files"
+
+
+      - name: Locate Kernel Image
+        id: locate_kernel
+        working-directory: kernel
+        run: |
+          CANDIDATES=(
+            "out/arch/arm64/boot/Image.gz-dtb"
+            "out/arch/arm64/boot/Image.gz"
+            "out/arch/arm64/boot/Image"
+          )
+          for candidate in "${CANDIDATES[@]}"; do
+            if [ -f "$candidate" ]; then
+              echo "image_path=$candidate" >> $GITHUB_OUTPUT
+              echo "Found: $candidate"
+              exit 0
+            fi
+          done
+          echo "No kernel image found!"
+          find . -iname "Image*" -not -path "./anykernel3/*" 2>/dev/null
+          exit 1
+
+      # ------------------------------------------------------------
+      # 7. Package with Local AnyKernel3
+      # ------------------------------------------------------------
+      - name: Package with AnyKernel3
+        working-directory: kernel
+        run: |
+          if [ ! -d "anykernel3" ]; then
+            echo "ERROR: anykernel3/ folder not found!"
+            exit 1
+          fi
+          IMAGE="${{ steps.locate_kernel.outputs.image_path }}"
+          cp "$IMAGE" anykernel3/Image.gz-dtb
+          if [ -d "out/modules_collected" ] && [ "$(ls -A out/modules_collected 2>/dev/null)" ]; then
+            mkdir -p anykernel3/modules/vendor/lib/modules
+            cp out/modules_collected/*.ko anykernel3/modules/vendor/lib/modules/
+            echo "Bundled $(ls out/modules_collected/*.ko | wc -l) kernel modules into the zip"
+          fi
+          cd anykernel3
+          rm -rf .git .github
+          zip -r9 AnyKernel3.zip * -x "*.zip"
+          cd ..
+          mv anykernel3/AnyKernel3.zip .
+
+      # ------------------------------------------------------------
+      # 8. Upload Flashable ZIP
+      # ------------------------------------------------------------
+      - name: Upload Artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: kernel-flashable-onyx
+          path: kernel/AnyKernel3.zip
