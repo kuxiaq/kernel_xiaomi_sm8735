@@ -36,7 +36,7 @@ jobs:
       - name: Integrate KernelSU Next
         working-directory: kernel
         run: |
-          curl -LSs "https://raw.githubusercontent.com/KernelSU-Next/KernelSU-Next/next/kernel/setup.sh" | bash -s -- --yes
+          curl -LSs "https://raw.githubusercontent.com/KernelSU-Next/KernelSU-Next/next/kernel/setup.sh" | bash -
           if [ $? -ne 0 ]; then
             echo "Script failed, falling back to manual copy"
             git clone --depth=1 https://github.com/KernelSU-Next/KernelSU-Next ../KernelSU-Next
