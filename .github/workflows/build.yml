@@ -25,19 +25,11 @@ jobs:
           sudo apt install -y git make gcc clang lld bc bison flex libssl-dev \
             libelf-dev ccache ninja-build curl
 
-      # ------------------------------------------------------------
-      # 1. Integrate ReSukiSU using its official script
-      #    ReSukiSU ships SUSFS natively — no separate SUSFS patch or
-      #    KernelSU-Next integration needed.
-      # ------------------------------------------------------------
       - name: Integrate ReSukiSU
         working-directory: kernel
         run: |
           curl -LSs "https://raw.githubusercontent.com/ReSukiSU/ReSukiSU/main/kernel/setup.sh" | bash
 
-      # ------------------------------------------------------------
-      # 2. Apply NoMount (local patches/source)
-      # ------------------------------------------------------------
       - name: Apply NoMount Patches
         working-directory: kernel
         run: |
@@ -73,9 +65,7 @@ jobs:
             cp nomount/src/* fs/
             echo "Copied $(ls nomount/src | wc -l) files from nomount/src/ to fs/"
           else
-            echo "ERROR: nomount/src/ not found. Per NoMount's own docs, the patch only"
-            echo "wires in hooks — nomount.c and nomount.h must be copied separately"
-            echo "from nomount/src/ into fs/. Add them to the repo and rerun."
+            echo "ERROR: nomount/src/ not found."
             exit 1
           fi
 
@@ -83,15 +73,11 @@ jobs:
           if grep -q "CONFIG_NOMOUNT" fs/Makefile fs/Kconfig 2>/dev/null; then
             if [ ! -f "fs/nomount.c" ]; then
               echo "ERROR: fs/Makefile or fs/Kconfig reference CONFIG_NOMOUNT but fs/nomount.c does not exist."
-              echo "The patch wired in the config option without adding the source file — check nomount/*.patch for a failed hunk on fs/nomount.c."
               exit 1
             fi
             echo "OK: fs/nomount.c present alongside CONFIG_NOMOUNT wiring."
           fi
 
-      # ------------------------------------------------------------
-      # 3. Download pinned Clang toolchain (CLANG_VERSION from build.config.constants)
-      # ------------------------------------------------------------
       - name: Setup Clang Toolchain
         working-directory: kernel
         run: |
@@ -121,9 +107,6 @@ jobs:
           echo "/tmp/clang/bin" >> $GITHUB_PATH
           echo "CLANG_VERSION=$CLANG_VERSION" >> $GITHUB_ENV
 
-      # ------------------------------------------------------------
-      # 4. Merge defconfig fragments (gki_defconfig + sun_perf.config + onyx_perf.config)
-      # ------------------------------------------------------------
       - name: Merge Defconfig Fragments
         working-directory: kernel
         run: |
@@ -136,14 +119,11 @@ jobs:
 
           cat >> out/.config << 'EOF'
           CONFIG_KSU=y
-          CONFIG_MSM_MMRM=y
+          CONFIG_LTO_CLANG_THIN=y
           EOF
 
           make ARCH=arm64 O=out olddefconfig
 
-      # ------------------------------------------------------------
-      # 5. Build kernel
-      # ------------------------------------------------------------
       - name: Build Kernel
         working-directory: kernel
         run: |
@@ -159,142 +139,6 @@ jobs:
             exit 1
           }
 
-      # ------------------------------------------------------------
-      # 6. Build out-of-tree QCOM/NXP kernel modules
-      # ------------------------------------------------------------
-      - name: Checkout Kernel Modules
-        uses: actions/checkout@v4
-        with:
-          repository: sm8735-dev/kernel_xiaomi_sm8735-modules
-          path: kernel-modules
-
-      - name: Stage Module Config Fragments
-        run: |
-          sudo mkdir -p /config
-          sudo chmod 777 /config
-          find kernel-modules -type f \( -name "*.conf" -o -name "*.mk" -o -name "*_defconfig" \) -print0 | \
-            while IFS= read -r -d '' f; do
-              cp -n "$f" "/config/$(basename "$f")" 2>/dev/null || true
-            done
-          echo "Staged $(ls /config | wc -l) config fragments:"
-          ls /config
-
-          echo "--- Generating config headers from staged .conf fragments ---"
-          for conf in /config/*.conf; do
-            [ -f "$conf" ] || continue
-            base=$(basename "$conf" .conf)
-            for out in "/config/${base}conf.h" "/config/${base}.h"; do
-              {
-                echo "#pragma once"
-                grep -E '^CONFIG_[A-Za-z0-9_]+=.+' "$conf" | while IFS='=' read -r key val; do
-                  case "$val" in
-                    y) echo "#define ${key} 1" ;;
-                    n) : ;;
-                    *) echo "#define ${key} ${val}" ;;
-                  esac
-                done
-              } > "$out"
-            done
-          done
-          echo "Generated $(ls /config/*.h 2>/dev/null | wc -l) header variants"
-
-      - name: Build Out-of-Tree Kernel Modules
-        working-directory: kernel
-        run: |
-          KDIR="$(pwd)/out"
-          MODROOT="$(pwd)/../kernel-modules"
-
-          EXTRA_INCLUDES=$(find "$MODROOT" -type d \( -name include -o -name uapi \) -printf ' -I%p')
-          echo "Collected $(echo "$EXTRA_INCLUDES" | wc -w) extra include paths"
-
-          MODULE_LIST=(
-            "qcom/opensource/mmrm-driver"
-            "qcom/opensource/mm-drivers/hw_fence"
-            "qcom/opensource/mm-drivers/msm_ext_display"
-            "qcom/opensource/mm-drivers/sync_fence"
-            "qcom/opensource/synx-kernel"
-            "qcom/opensource/securemsm-kernel"
-            "qcom/opensource/audio-kernel"
-            "qcom/opensource/camera-kernel"
-            "qcom/opensource/display-drivers/msm"
-            "qcom/opensource/video-driver"
-            "qcom/opensource/eva-kernel"
-            "qcom/opensource/graphics-kernel"
-            "qcom/opensource/dsp-kernel"
-            "qcom/opensource/spu-kernel"
-            "qcom/opensource/touch-drivers"
-            "qcom/opensource/data-kernel/drivers/smem-mailbox"
-            "qcom/opensource/datarmnet/core"
-            "qcom/opensource/datarmnet-ext/mem"
-            "qcom/opensource/datarmnet-ext/aps"
-            "qcom/opensource/datarmnet-ext/offload"
-            "qcom/opensource/datarmnet-ext/perf"
-            "qcom/opensource/datarmnet-ext/perf_tether"
-            "qcom/opensource/datarmnet-ext/sch"
-            "qcom/opensource/datarmnet-ext/shs"
-            "qcom/opensource/datarmnet-ext/wlan"
-            "qcom/opensource/dataipa/drivers/platform/msm"
-            "qcom/opensource/wlan/platform"
-            "qcom/opensource/wlan/qcacld-3.0"
-            "qcom/opensource/bt-kernel"
-            "nxp/opensource/driver"
-          )
-
-          EXTRA_SYMBOLS=""
-          FAILED_MODULES=()
-
-          for mod in "${MODULE_LIST[@]}"; do
-            MODPATH="$MODROOT/$mod"
-            if [ ! -d "$MODPATH" ]; then
-              echo "SKIP: $mod (directory not found in modules repo)"
-              continue
-            fi
-            if [ ! -f "$MODPATH/Kbuild" ] && [ ! -f "$MODPATH/Makefile" ]; then
-              echo "SKIP: $mod (no Kbuild/Makefile — Soong-only, cannot build standalone)"
-              continue
-            fi
-
-            echo "=== Building $mod ==="
-            set +e
-            make -C "$KDIR" M="$MODPATH" \
-              ARCH=arm64 CC=clang LLVM=1 LLVM_IAS=1 \
-              CROSS_COMPILE=aarch64-linux-gnu- \
-              KBUILD_EXTRA_SYMBOLS="$EXTRA_SYMBOLS" \
-              KCFLAGS="$EXTRA_INCLUDES" \
-              modules
-            STATUS=$?
-            set -e
-
-            if [ $STATUS -ne 0 ]; then
-              echo "FAILED: $mod — continuing so later modules still attempt to build"
-              FAILED_MODULES+=("$mod")
-              continue
-            fi
-
-            if [ -f "$MODPATH/Module.symvers" ]; then
-              EXTRA_SYMBOLS="$EXTRA_SYMBOLS $MODPATH/Module.symvers"
-            fi
-          done
-
-          echo ""
-          echo "--- Module build summary ---"
-          if [ ${#FAILED_MODULES[@]} -eq 0 ]; then
-            echo "All modules built successfully."
-          else
-            echo "Failed modules (likely wrong build order — move these later, after their real dependency):"
-            printf '  %s\n' "${FAILED_MODULES[@]}"
-          fi
-
-      - name: Collect Kernel Modules
-        working-directory: kernel
-        run: |
-          mkdir -p out/modules_collected
-          find ../kernel-modules -name "*.ko" -exec cp {} out/modules_collected/ \;
-          echo "Collected $(ls out/modules_collected | wc -l) .ko files"
-
-      # ------------------------------------------------------------
-      # 7. Locate Kernel Image
-      # ------------------------------------------------------------
       - name: Locate Kernel Image
         id: locate_kernel
         working-directory: kernel
@@ -315,9 +159,6 @@ jobs:
           find . -iname "Image*" -not -path "./anykernel3/*" 2>/dev/null
           exit 1
 
-      # ------------------------------------------------------------
-      # 8. Package with AnyKernel3
-      # ------------------------------------------------------------
       - name: Package with AnyKernel3
         working-directory: kernel
         run: |
@@ -327,22 +168,13 @@ jobs:
           fi
           IMAGE="${{ steps.locate_kernel.outputs.image_path }}"
           cp "$IMAGE" anykernel3/Image.gz-dtb
-          if [ -d "out/modules_collected" ] && [ "$(ls -A out/modules_collected 2>/dev/null)" ]; then
-            mkdir -p anykernel3/modules/vendor/lib/modules
-            cp out/modules_collected/*.ko anykernel3/modules/vendor/lib/modules/
-            echo "Bundled $(ls out/modules_collected/*.ko | wc -l) kernel modules into the zip"
-          fi
           cd anykernel3
-          rm -rf .git .github
-          zip -r9 AnyKernel3.zip * -x "*.zip"
+          zip -r9 Genesis-OSS.zip * -x "*.zip"
           cd ..
-          mv anykernel3/AnyKernel3.zip .
+          mv anykernel3/Genesis-OSS.zip .
 
-      # ------------------------------------------------------------
-      # 9. Upload Flashable ZIP
-      # ------------------------------------------------------------
       - name: Upload Artifacts
         uses: actions/upload-artifact@v4
         with:
-          name: kernel-flashable-onyx
-          path: kernel/AnyKernel3.zip
+          name: Genesis-OSS-onyx
+          path: kernel/Genesis-OSS.zip
