@@ -106,7 +106,6 @@ jobs:
           tar -xzf /tmp/clang.tar.gz -C /tmp/clang
           echo "/tmp/clang/bin" >> $GITHUB_PATH
           echo "CLANG_VERSION=$CLANG_VERSION" >> $GITHUB_ENV
-
       - name: Merge Defconfig Fragments
         working-directory: kernel
         run: |
